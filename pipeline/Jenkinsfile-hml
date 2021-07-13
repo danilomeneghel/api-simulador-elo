@@ -1,0 +1,190 @@
+#!groovy
+
+@Library('ApproversLibrary') _
+
+def notifyStatusChangeViaTeams(buildStatus) {
+    switch (buildStatus) {
+        case 'SUCCESS':
+            office365ConnectorSend status:buildStatus, message:"&#x1F60E; SUCESSO: Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+
+        case 'UNSTABLE':
+            office365ConnectorSend status:buildStatus, message:"&#x1F61F; INSTAVEL: Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+
+        case 'FAILURE':
+            office365ConnectorSend status:buildStatus, message:"&#x1F631; * * BUILD QUEBRADA * * : Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+    }
+}
+
+pipeline {
+    environment {
+        APP_NAME = "novo-simulador-api-parametrizacao"
+
+        FROM_ENVIRONMENT = "dev"
+        FROM_PROJECT_NAME = "plataforma-certificadora-${FROM_ENVIRONMENT}"
+
+        TO_ENVIRONMENT = "hml"
+        TO_PROJECT_NAME = "plataforma-certificadora-${TO_ENVIRONMENT}"
+
+        MVN_CONFIG = 'maven-settings'
+        MEM_SETTINGS_JVM="'-Xms1024m -Xmx1024m -Dfile.encoding=UTF8'"
+
+        GRAYLOG_HOST = "udp:graylog-qa.sp.elocloud"
+        GRAYLOG_PORT = "12201"
+        PATH_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/path":"/actuator/prometheus"}}}}}'
+        PORT_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/port":"8080"}}}}}'
+        SCRAPE_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true"}}}}}'
+
+		MONGO_PORT = 27017
+		MONGO_HOST_01 = "mongodb-plataforma-cert-sp-${TO_ENVIRONMENT}-01.sp.elocloud:${MONGO_PORT}"
+		MONGO_HOST_02 = "mongodb-plataforma-cert-sp-${TO_ENVIRONMENT}-02.sp.elocloud:${MONGO_PORT}"
+		MONGO_HOST_03 = "mongodb-plataforma-cert-sp-${TO_ENVIRONMENT}-03.sp.elocloud:${MONGO_PORT}"
+        MONGODB_HOST = "${MONGO_HOST_01},${MONGO_HOST_02},${MONGO_HOST_03}"
+        MONGODB_DATABASE = "cadastro_plataforma_certificacao"
+        MONGODB_OPTIONS = "?authSource=admin"
+    }
+
+    agent {
+        node { label 'maven' }
+    }
+
+    stages {
+        stage('Approve?') {
+            steps {
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        //approvers = approvers.hasPermissionToHml()
+                        approvers = '9000042,02.000244,cp.05690,02.000642'
+                        userInput = input(id: 'promoteToHML', message: 'Aprovar promoção para HML?', submitter: approvers)
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve Image Stream') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${TO_PROJECT_NAME}") {
+                            echo "Using project: ${openshift.project()}"
+                            openshift.raw("import-image", "${TO_PROJECT_NAME}/${APP_NAME}", "--from=\'docker-registry.default.svc:5000/${FROM_PROJECT_NAME}/${APP_NAME}\'", "--confirm")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Promote to HML') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${TO_PROJECT_NAME}") {
+                            if (openshift.raw("get", "is/${APP_NAME}", "-o=jsonpath=\'{.spec.tags[?(@.name==\"${TO_ENVIRONMENT}\")].name}'").out.trim() != TO_ENVIRONMENT) {
+                                echo 'First time creation...'
+                                openshift.tag("${FROM_PROJECT_NAME}/${APP_NAME}:latest", "${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}")
+                                openshift.tag("${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}", "${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}-previous")
+                            } else {
+                                echo 'Updating tags...'
+                                openshift.tag("${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}", "${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}-previous")
+                                openshift.tag("${FROM_PROJECT_NAME}/${APP_NAME}:latest", "${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Create HML') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${TO_PROJECT_NAME}") {
+                            if (!openshift.selector("dc", "${APP_NAME}").exists()) {
+                            	def app = openshift.newApp("${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}",
+                                        "--name=${APP_NAME}",
+                                        "-e OPENSHIFT_KUBE_PING_LABELS=application=${APP_NAME}",
+                                        "-e OPENSHIFT_KUBE_PING_NAMESPACE=${TO_PROJECT_NAME}"
+                                )
+
+                                openshift.set("probe", "deploymentConfig/${APP_NAME}", "--readiness", "--liveness",
+                                        "--get-url=http://:8080/actuator/health", "--initial-delay-seconds=40",
+                                        "--failure-threshold=3", "--period-seconds=5", "--timeout-seconds=10")
+
+								openshift.set("resources", "deploymentConfig/${APP_NAME}", "--limits=cpu=750m,memory=1Gi",
+										"--requests=cpu=100m,memory=512Mi")
+
+                        		openshift.set("env", "--from=secret/mongodb", "--prefix=MONGODB_",
+        		                    "deploymentconfig/${APP_NAME}")
+
+                           	    openshift.selector("svc", "${APP_NAME}").delete()
+                                openshift.selector("dc",  "${APP_NAME}").expose("--port=8080,8778", "--generator=service/v1")
+
+                                if (openshift.selector("svc", "${APP_NAME}").exists()) {
+                                    app.narrow("svc").expose()
+                                }
+                            }
+
+                            echo "Applying Environment Variable"
+						    openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "JAVA_OPTIONS=${MEM_SETTINGS_JVM}")
+							openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GC_MAX_METASPACE_SIZE=200")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "SPRING_PROFILES_ACTIVE=${TO_ENVIRONMENT}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GRAYLOG_HOST=${GRAYLOG_HOST}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GRAYLOG_PORT=${GRAYLOG_PORT}")
+
+                            // MongoDB
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_HOST=${MONGODB_HOST}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_DATABASE=${MONGODB_DATABASE}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_OPTIONS=${MONGODB_OPTIONS}")
+
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "PATH_ACTUATOR_PROMETHEUS=${PATH_ACTUATOR_PROMETHEUS}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "PORT_ACTUATOR_PROMETHEUS=${PORT_ACTUATOR_PROMETHEUS}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "SCRAPE_ACTUATOR_PROMETHEUS=${SCRAPE_ACTUATOR_PROMETHEUS}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Want to undo promotion?') {
+            steps {
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        userInput = input(id: 'promoteToHML', message: 'Want to undo promotion?', submitter: approvers, parameters: [
+                                booleanParam(name: 'Sim', defaultValue: false, description: 'Check this if you want to undo this promotion')
+                        ])
+
+                        if (userInput) {
+                            stage('Undoing promotion') {
+                                openshift.withCluster() {
+                                    openshift.withProject("${TO_PROJECT_NAME}") {
+                                        openshift.tag("${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}-previous", "${TO_PROJECT_NAME}/${APP_NAME}:${TO_ENVIRONMENT}")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+		stage('Annotate Prometheus') {
+            steps {
+                withMaven(
+                       maven: 'M3',
+                       mavenSettingsConfig: MVN_CONFIG) {
+					sh "oc patch dc/${APP_NAME} -p '${PORT_ACTUATOR_PROMETHEUS}' -n ${TO_PROJECT_NAME}"
+        			sh "oc patch dc/${APP_NAME} -p '${PATH_ACTUATOR_PROMETHEUS}' -n ${TO_PROJECT_NAME}"
+        			sh "oc patch dc/${APP_NAME} -p '${SCRAPE_ACTUATOR_PROMETHEUS}' -n ${TO_PROJECT_NAME}"
+                }
+            }
+        }
+    }
+
+    post {
+        changed {
+            notifyStatusChangeViaTeams(currentBuild.currentResult)
+        }
+    }
+}

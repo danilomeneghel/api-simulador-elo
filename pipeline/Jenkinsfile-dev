@@ -1,0 +1,275 @@
+#!groovy
+
+def notifyStatusChangeViaTeams(buildStatus) {
+    switch (buildStatus) {
+        case 'SUCCESS':
+            office365ConnectorSend status:buildStatus, message:"&#x1F60E; SUCESSO: Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+
+        case 'UNSTABLE':
+            office365ConnectorSend status:buildStatus, message:"&#x1F61F; INSTAVEL: Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+
+        case 'FAILURE':
+            office365ConnectorSend status:buildStatus, message:"&#x1F631; * * BUILD QUEBRADA * * : Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+    }
+}
+
+def getPomVersion() {
+    def pom = readMavenPom file: 'pom.xml'
+    def version = pom.version ? pom.version : null
+    return version
+}
+
+def getBuildNumber() {
+    return "${env.BUILD_NUMBER}"
+}
+
+def getGitCommit() {
+    return sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+}
+
+def patchImageLabels(bc) {
+    bc.patch('\'{"spec":{"output":{"imageLabels":[{"name":"br.com.elo.build.commit.id","value":"' + getGitCommit() + '"},{"name":"br.com.elo.build.number","value": "' + getBuildNumber() + '"}]}}}\'')
+}
+
+def getTag() {
+    return getPomVersion() + "-" + getBuildNumber()
+}
+
+pipeline {
+
+    environment {
+        ENVIRONMENT = "dev"
+        PROJECT_NAME = "plataforma-certificadora-${ENVIRONMENT}"
+        APP_NAME = "novo-simulador-api-parametrizacao"
+		SPRING_PROFILES_ACTIVE = "${ENVIRONMENT}"
+
+		FORTIFY_APP_NAME = "NOVOSIMULADOR"
+		FORTIFY_APP_VERSION = "api-parametrizacao"
+
+        MVN_CONFIG = 'maven-settings'
+        MEM_SETTINGS_JVM = "'-Xms1024m -Xmx1024m -Dfile.encoding=UTF8'"
+
+		GRAYLOG_HOST = "udp:graylog-${ENVIRONMENT}.sp.elocloud"
+        GRAYLOG_PORT = "12201"
+        MONGODB_HOST = "mongodb.plataforma-certificadora-${ENVIRONMENT}.svc.cluster.local:27017"
+        MONGODB_DATABASE = "cadastro_plataforma_certificacao"
+        MONGODB_OPTIONS = "?authSource=admin"
+        PATH_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/path":"/actuator/prometheus"}}}}}'
+        PORT_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/port":"8080"}}}}}'
+        SCRAPE_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true"}}}}}'
+        SONAR_ADRESS = 'http://10.35.108.190'
+
+    }
+    agent {
+        node { label 'maven-java11' }
+    }
+
+    options {
+        skipStagesAfterUnstable()
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                withMaven(
+                        maven: 'M3',
+                        mavenSettingsConfig: MVN_CONFIG) {
+
+                    // Run the maven build
+                    sh "mvn clean install -DskipTests"
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                withMaven(
+                        maven: 'M3',
+                        mavenSettingsConfig: MVN_CONFIG) {
+                    sh "mvn verify"
+                }
+            }
+        }
+
+       stage('QA & Security Scans') {
+       parallel {
+
+       stage('Sonar Scan') {
+           steps {
+               withMaven(
+                       maven: 'M3',
+                       mavenSettingsConfig: MVN_CONFIG) {
+                   sh "mvn -Dsonar.host.url=${SONAR_ADRESS} sonar:sonar"
+               }
+           }
+       }
+
+       stage('Fortify Scan') {
+            steps {
+                withMaven(
+                       maven: 'M3',
+                      mavenSettingsConfig: MVN_CONFIG) {
+                   fortifyClean addJVMOptions: '', buildID: "${FORTIFY_APP_VERSION}", logFile: '', maxHeap: ''
+                   fortifyUpdate proxyPassword: '', proxyURL: '', proxyUsername: '', updateServerURL: 'https://crivo.elo.com.br/ssc'
+                   fortifyTranslate addJVMOptions: '', buildID: "${FORTIFY_APP_VERSION}", excludeList: '', logFile: '', maxHeap: '', projectScanType: fortifyJava(javaAddOptions: '', javaClasspath: '', javaSrcFiles: '"src/main/**/*.java"', javaVersion: '11')
+               	   fortifyScan addJVMOptions: '-Xmx2G', addOptions: '', buildID: "${FORTIFY_APP_VERSION}", customRulepacks: '', logFile: '', maxHeap: '', resultsFile: "${FORTIFY_APP_VERSION}.fpr"
+               	   fortifyUpload appName: "${FORTIFY_APP_NAME}", appVersion: "${FORTIFY_APP_VERSION}", failureCriteria: 'category:path manipulation', filterSet: '', pollingInterval: '', resultsFile: "${FORTIFY_APP_VERSION}.fpr"
+               }
+           }
+       }
+
+       }
+       }
+
+       stage('Security Gate') {
+            steps {
+			   script{
+
+				   fortifyResult = sh(returnStdout:true , script: "java -jar fortify/fortify-api-client-0.0.5-jar-with-dependencies.jar report -n ${FORTIFY_APP_NAME} -v ${FORTIFY_APP_VERSION}").trim()
+                   fortifyMsg = "Por favor efetuar a correção, maiores detalhes para remediação consulte crivo.elo.com.br"
+                   echo "Resultado Crivo(SAST): $fortifyResult"
+
+
+                   if (!fortifyResult.contains('0 Cr?ticas')){
+	 					  echo "[SECURITY-GATE] Foram encontradas vulnerabilidades Críticas no código-fonte! $fortifyMsg"
+						  currentBuild.result = 'FAILURE'
+						  error("[SECURITY-GATE] Foram encontradas vulnerabilidades Críticas no código-fonte! $fortifyMsg")
+				   }
+				   if (!fortifyResult.contains('0 Altas')){
+	 					  echo "[SECURITY-GATE] Foram encontradas vulnerabilidades Altas no código-fonte! $fortifyMsg"
+						  currentBuild.result = 'FAILURE'
+						  error("[SECURITY-GATE] Foram encontradas vulnerabilidades Críticas no código-fonte! $fortifyMsg")
+				   }
+
+
+				}
+			}
+        }
+
+
+
+        stage('Create Image Builder') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            script {
+                                if (!openshift.selector("bc", "${APP_NAME}").exists()) {
+                                    openshift.newBuild("--name=${APP_NAME}", "--image-stream=openjdk-11-rhel7:latest", "--binary")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Start S2I Build') {
+            steps {
+                script {
+                    def version = getPomVersion()
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            echo "Using project: ${openshift.project()}"
+
+                            def bc = openshift.selector("bc", "${APP_NAME}");
+                            patchImageLabels(bc);
+                            bc.startBuild("--from-file=./target/${APP_NAME}-${version}.jar", "--wait=true")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Promote to DEV') {
+            steps {
+                script {
+                    def tag = getTag()
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            echo "Using project: promote to ${ENVIRONMENT} ${APP_NAME}"
+                            openshift.tag("${APP_NAME}:latest", "${APP_NAME}:${tag}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Create DEV') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            if (!openshift.selector("dc", "${APP_NAME}").exists()) {
+                                def app = openshift.newApp("${APP_NAME}",
+                                        "--name=${APP_NAME}",
+                                        "-e OPENSHIFT_KUBE_PING_LABELS=application=${APP_NAME}",
+                                        "-e OPENSHIFT_KUBE_PING_NAMESPACE=${PROJECT_NAME}",
+                                        "-e HTTP_PORT=8080"
+                                )
+
+                                openshift.set("probe", "deploymentConfig/${APP_NAME}", "--readiness", "--liveness",
+                                        "--get-url=http://:8080/actuator/health", "--initial-delay-seconds=40",
+                                        "--failure-threshold=3", "--period-seconds=5", "--timeout-seconds=10")
+
+								openshift.set("resources", "deploymentConfig/${APP_NAME}", "--limits=cpu=750m,memory=1Gi",
+										"--requests=cpu=100m,memory=512Mi")
+
+                        		openshift.set("env", "--from=secret/mongodb", "--prefix=MONGODB_",
+        		                    "deploymentconfig/${APP_NAME}")
+
+
+                                openshift.selector("svc", "${APP_NAME}").delete()
+                                openshift.selector("dc", "${APP_NAME}").expose("--port=8080,8778",
+                                        "--generator=service/v1")
+
+                                if (openshift.selector("svc", "${APP_NAME}").exists()) {
+                                    app.narrow("svc").expose()
+                                }
+                            }
+
+                            echo "Applying Environment Variable"
+						    openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "JAVA_OPTIONS=${MEM_SETTINGS_JVM}")
+							openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GC_MAX_METASPACE_SIZE=200")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GRAYLOG_HOST=${GRAYLOG_HOST}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GRAYLOG_PORT=${GRAYLOG_PORT}")
+                            // MongoDB
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_HOST=${MONGODB_HOST}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_DATABASE=${MONGODB_DATABASE}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_OPTIONS=${MONGODB_OPTIONS}")
+
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "PATH_ACTUATOR_PROMETHEUS=${PATH_ACTUATOR_PROMETHEUS}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "PORT_ACTUATOR_PROMETHEUS=${PORT_ACTUATOR_PROMETHEUS}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "SCRAPE_ACTUATOR_PROMETHEUS=${SCRAPE_ACTUATOR_PROMETHEUS}")
+
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Annotate Prometheus') {
+            steps {
+                withMaven(
+                       maven: 'M3',
+                       mavenSettingsConfig: MVN_CONFIG) {
+					sh "oc patch dc/${APP_NAME} -p '${PORT_ACTUATOR_PROMETHEUS}' -n ${PROJECT_NAME}"
+                    sh "oc patch dc/${APP_NAME} -p '${PATH_ACTUATOR_PROMETHEUS}' -n ${PROJECT_NAME}"
+                    sh "oc patch dc/${APP_NAME} -p '${SCRAPE_ACTUATOR_PROMETHEUS}' -n ${PROJECT_NAME}"
+                }
+            }
+        }
+    }
+
+    post {
+        changed {
+            notifyStatusChangeViaTeams(currentBuild.currentResult)
+        }
+    }
+
+}

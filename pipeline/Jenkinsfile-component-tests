@@ -1,0 +1,256 @@
+#!groovy
+
+def notifyStatusChangeViaTeams(buildStatus) {
+    switch (buildStatus) {
+        case 'SUCCESS':
+            office365ConnectorSend status:buildStatus, message:"&#x1F60E; SUCESSO: Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+
+        case 'UNSTABLE':
+            office365ConnectorSend status:buildStatus, message:"&#x1F61F; INSTAVEL: Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+
+        case 'FAILURE':
+            office365ConnectorSend status:buildStatus, message:"&#x1F631; * * BUILD QUEBRADA * * : Job ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)", webhookUrl:'https://outlook.office.com/webhook/60ec0f0a-6518-475c-b673-29c66ec90092@1778ae9f-6f4a-44ca-930b-327c29104576/IncomingWebhook/eb36beed71e1476186b0e108dba54dce/8c6d12c8-fbf7-41d8-81f6-b55f557b4448'
+            break
+    }
+}
+
+pipeline {
+
+    environment {
+        ENVIRONMENT = "tst-cpt"
+        PROJECT_NAME = "plataforma-certificadora-${ENVIRONMENT}"
+        DEV_PROJECT_NAME = "plataforma-certificadora-dev"
+
+        APP_NAME = "novo-simulador-api-parametrizacao"
+		SPRING_PROFILES_ACTIVE = "${ENVIRONMENT}"
+
+        MVN_CONFIG = 'maven-settings'
+        MEM_SETTINGS_JVM = "'-Xms1024m -Xmx1024m -Dfile.encoding=UTF8'"
+        MONGO_SERVICE_NAME = 'mongodb'
+		GRAYLOG_HOST = "udp:graylog-${ENVIRONMENT}.sp.elocloud"
+        GRAYLOG_PORT = "12201"
+        MONGODB_HOST = "mongodb.plataforma-certificadora-${ENVIRONMENT}.svc.cluster.local:27017"
+        MONGODB_DATABASE = "cadastro_plataforma_certificacao"
+        MONGODB_OPTIONS = "?authSource=admin"
+        PATH_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/path":"/actuator/prometheus"}}}}}'
+        PORT_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/port":"8080"}}}}}'
+        SCRAPE_ACTUATOR_PROMETHEUS = '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true"}}}}}'
+        NOVO_SIMULADOR_API_PARAMETRIZACAO_URL = "http://${APP_NAME}.${PROJECT_NAME}.svc:8080/api/"
+        ENVIRONMENT_VARIABLES =  "-DURL_TESTE_COMPONENTE=${NOVO_SIMULADOR_API_PARAMETRIZACAO_URL} "
+    }
+    agent {
+        node { label 'maven-java11' }
+    }
+
+    options {
+        skipStagesAfterUnstable()
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Spin Dependencies') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            echo "Scaling Down Mongo, just to make sure nothing is inconsistent..."
+                            openshift.selector("dc", "${MONGO_SERVICE_NAME}").scale('--replicas=0')
+
+                            echo "Scaling Up Mongo, to start tests..."
+                            openshift.selector("dc", "${MONGO_SERVICE_NAME}").scale('--replicas=1')
+                        }
+                    }
+                }
+            }
+        }
+
+        stage(' Health Check') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            echo "Waiting for MongoDB to be ready"
+                            latestDeploymentVersion = openshift.selector("dc", "${MONGO_SERVICE_NAME}")
+                                    .object().status.latestVersion
+                            rc = openshift.selector('rc', "${MONGO_SERVICE_NAME}-${latestDeploymentVersion}")
+
+                            rc.untilEach(1) {
+                                def rcMap = it.object()
+                                return (rcMap.status.replicas.equals(rcMap.status.readyReplicas))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve Image Stream') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            echo "Retrieving image : ${PROJECT_NAME}/${APP_NAME} from ${DEV_PROJECT_NAME}/${APP_NAME}"
+                            openshift.raw("import-image", "${PROJECT_NAME}/${APP_NAME}", "--from=\'docker-registry.default.svc:5000/${DEV_PROJECT_NAME}/${APP_NAME}\'", "--confirm")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Promote to QA') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            if (openshift.raw("get", "is/${APP_NAME}", "-o=jsonpath=\'{.spec.tags[?(@.name==\"tst-cpt\")].name}'").out.trim() != 'tst-cpt') {
+                                echo 'First time creation...'
+                                openshift.tag("${DEV_PROJECT_NAME}/${APP_NAME}:latest", "${PROJECT_NAME}/${APP_NAME}:tst-cpt")
+                                openshift.tag("${PROJECT_NAME}/${APP_NAME}:tst-cpt", "${PROJECT_NAME}/${APP_NAME}:tst-cpt-previous")
+                            } else {
+                                echo 'Updating tags...'
+                                openshift.tag("${PROJECT_NAME}/${APP_NAME}:tst-cpt", "${PROJECT_NAME}/${APP_NAME}:tst-cpt-previous")
+                                openshift.tag("${DEV_PROJECT_NAME}/${APP_NAME}:latest", "${PROJECT_NAME}/${APP_NAME}:tst-cpt")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage('Create QA') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            if (!openshift.selector("dc", "${APP_NAME}").exists()) {
+                                def app = openshift.newApp("${PROJECT_NAME}/${APP_NAME}:${ENVIRONMENT}",
+                                        "--name=${APP_NAME}",
+                                        "-e OPENSHIFT_KUBE_PING_LABELS=application=${APP_NAME}",
+                                        "-e OPENSHIFT_KUBE_PING_NAMESPACE=${PROJECT_NAME}"
+                                )
+
+                                openshift.set("probe", "deploymentConfig/${APP_NAME}", "--readiness", "--liveness",
+                                        "--get-url=http://:8080/actuator/health", "--initial-delay-seconds=80",
+                                        "--failure-threshold=3", "--period-seconds=5", "--timeout-seconds=10")
+
+                                openshift.set("resources", "deploymentConfig/${APP_NAME}", "--limits=cpu=750m,memory=2Gi",
+                                        "--requests=cpu=100m,memory=512Mi")
+
+                                openshift.set("env", "--from=secret/mongodb", "--prefix=MONGODB_",
+                                        "deploymentconfig/${APP_NAME}")
+
+                                openshift.selector("svc", "${APP_NAME}").delete()
+                                openshift.selector("dc",  "${APP_NAME}").expose("--port=8080,8778", "--generator=service/v1")
+
+                                if (openshift.selector("svc", "${APP_NAME}").exists()) {
+                                    app.narrow("svc").expose()
+                                }
+                            }
+
+                            echo "Applying Environment Variable"
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "JAVA_OPTIONS=${MEM_SETTINGS_JVM}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "GC_MAX_METASPACE_SIZE=200")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "SPRING_PROFILES_ACTIVE=${ENVIRONMENT}")
+
+                            // MongoDB
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_HOST=${MONGODB_HOST}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_DATABASE=${MONGODB_DATABASE}")
+                            openshift.set("env", "deploymentconfig/${APP_NAME}", "--overwrite", "MONGODB_OPTIONS=${MONGODB_OPTIONS}")
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage('Image Start & Health Check') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+
+                            echo "Scaling Up Service..."
+                            openshift.selector("dc", "${APP_NAME}").scale('--replicas=1')
+
+                            echo "Waiting for Service Nest-Core to be ready"
+                            def latestDeploymentVersion = openshift.selector("dc", "${APP_NAME}")
+                                    .object().status.latestVersion
+                            def rc = openshift.selector('rc', "${APP_NAME}-${latestDeploymentVersion}")
+
+                            rc.untilEach(1){
+                                def rcMap = it.object()
+                                return (rcMap.status.replicas.equals(rcMap.status.readyReplicas))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Component Tests') {
+            steps {
+                withMaven(
+                        maven: 'M3',
+                        mavenSettingsConfig: MVN_CONFIG) {
+                    sh("mvn ${ENVIRONMENT_VARIABLES} -f tests/component-tests/pom.xml clean install")
+                }
+            }
+
+            post {
+                always{
+                    withMaven(
+                            maven: 'M3',
+                            mavenSettingsConfig: MVN_CONFIG) {
+                        cucumber '**/cucumber.json'
+                    }
+                }
+            }
+        }
+
+        stage('Tag Image') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject("${PROJECT_NAME}") {
+                            if (openshift.raw("get", "is/${APP_NAME}", "-o=jsonpath=\'{.spec.tags[?(@.name==\"qa\")].name}'").out.trim() != 'qa') {
+                                echo 'First time creation...'
+                                openshift.tag("${PROJECT_NAME}/${APP_NAME}:tst-cpt", "${PROJECT_NAME}/${APP_NAME}:qa")
+                                openshift.tag("${PROJECT_NAME}/${APP_NAME}:qa", "${PROJECT_NAME}/${APP_NAME}:qa-previous")
+                            } else {
+                                echo 'Updating tags...'
+                                openshift.tag("${PROJECT_NAME}/${APP_NAME}:qa", "${PROJECT_NAME}/${APP_NAME}:qa-previous")
+                                openshift.tag("${PROJECT_NAME}/${APP_NAME}:tst-cpt", "${PROJECT_NAME}/${APP_NAME}:qa")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        changed {
+            notifyStatusChangeViaTeams(currentBuild.currentResult)
+        }
+
+        always {
+            script {
+                openshift.withCluster() {
+                    openshift.withProject("${PROJECT_NAME}") {
+                        echo "Scaling Down Service, just to make sure nothing is inconsistent..."
+                        openshift.selector("dc", "${APP_NAME}").scale('--replicas=0')
+                        echo "Scaling Down Mongo, just to make sure nothing is inconsistent..."
+                        openshift.selector("dc", "${MONGO_SERVICE_NAME}").scale('--replicas=0')
+
+                    }
+                }
+            }
+        }
+
+    }
+
+}

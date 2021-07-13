@@ -1,0 +1,32 @@
+spring:
+  main:
+    banner-mode: 'off'
+  application:
+    name: novo-simulador-api-parametrizacao
+    version: 1.0.0
+  profiles:
+    active: local
+  jpa:
+    open-in-view: true
+  data:
+    mongodb:
+      # Example URI connection string : mongodb://PTCERT_API_USR:dbpass_dev_ptcert_api@localhost:27017/cadastro_plataforma_certificacao?authSource=admin
+      uri: "mongodb://${MONGODB_DATABASE_USERNAME:PTCERT_API_USR}:${MONGODB_DATABASE_PASSWORD:dbpass_dev_ptcert_api}@${MONGODB_HOST:localhost:27017}/${MONGODB_DATABASE:cadastro_plataforma_certificacao}${MONGODB_OPTIONS:?authSource=admin}"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: '*'
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      sla:
+        http.server.requests: 100ms, 200ms, 300ms, 400ms, 500ms, 600ms, 700ms, 800ms, 900ms, 1000ms
+    web:
+      server:
+        auto-time-requests: false

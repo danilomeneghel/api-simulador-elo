@@ -1,0 +1,22 @@
+kind: "BuildConfig"
+apiVersion: "v1"
+metadata:
+  name: "novo-simulador-api-parametrizacao-component-tests"
+spec:
+  nodeSelector: {}
+  output: {}
+  postCommit: {}
+  resources: {}
+  runPolicy: Serial
+  source:
+    git:
+      ref: master
+      uri: 'https://gitlab.elocloud.ninja/novo-simulador/novo-simulador-api-parametrizacao.git'
+    sourceSecret:
+      name: gitlab-secret
+    type: Git
+  strategy:
+    jenkinsPipelineStrategy:
+      jenkinsfilePath: pipeline/Jenkinsfile-component-tests
+    type: JenkinsPipeline
+  triggers: []
